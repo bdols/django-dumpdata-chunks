@@ -25,6 +25,9 @@ class Command(BaseCommand):
             help='Use natural keys if they are available.'),
         make_option('-a', '--all', action='store_true', dest='use_base_manager', default=False,
             help="Use Django's base manager to dump all models stored in the database, including those that would otherwise be filtered or modified by a custom manager."),
+        make_option('--pks', dest='primary_keys', help="Only dump objects with "
+            "given primary keys. Accepts a comma seperated list of keys. "
+            "This option will only work when you specify one model."),
     )
     help = ("Output the contents of the database as a fixture of the given "
             "format (using each model's default manager unless --all is "
@@ -45,6 +48,12 @@ class Command(BaseCommand):
         show_traceback = options.get('traceback')
         use_natural_keys = options.get('use_natural_keys')
         use_base_manager = options.get('use_base_manager')
+        pks = options.get('primary_keys')
+
+        if pks:
+            primary_keys = pks.split(',')
+        else:
+            primary_keys = []
 
         excluded_apps = set()
         excluded_models = set()
@@ -63,8 +72,12 @@ class Command(BaseCommand):
                     raise CommandError('Unknown app in excludes: %s' % exclude)
 
         if len(app_labels) == 0:
+            if primary_keys:
+                raise CommandError("You can only use --pks option with one model")
             app_list = SortedDict((app, None) for app in get_apps() if app not in excluded_apps)
         else:
+            if len(app_labels) > 1 and primary_keys:
+                raise CommandError("You can only use --pks option with one model")
             app_list = SortedDict()
             for label in app_labels:
                 try:
@@ -85,6 +98,8 @@ class Command(BaseCommand):
                     else:
                         app_list[app] = [model]
                 except ValueError:
+                    if primary_keys:
+                        raise CommandError("You can only use --pks option with one model")
                     # This is just an app - no model qualifier
                     app_label = label
                     try:
@@ -98,38 +113,59 @@ class Command(BaseCommand):
         # Check that the serialization format exists; this is a shortcut to
         # avoid collating all the objects and _then_ failing.
         if format not in serializers.get_public_serializer_formats():
+            try:
+                serializers.get_serializer(format)
+            except serializers.SerializerDoesNotExist:
+                pass
+
             raise CommandError("Unknown serialization format: %s" % format)
 
-        try:
-            serializers.get_serializer(format)
-        except KeyError:
-            raise CommandError("Unknown serialization format: %s" % format)
+        def get_objects_into_chunks(max_records_per_chunk):
+            # Collate the objects to be serialized.
+            model_count = 0
 
-        # Now collate the objects to be serialized.
-        objects = []
-        model_count = 1000
-        chunk_count = 1000
-        for model in sort_dependencies(app_list.items()):
-            model_count += 1 
-            if model in excluded_models:
-                continue
-            if not model._meta.proxy and router.allow_syncdb(using, model):
-                if use_base_manager:
-                    objects.extend(model._base_manager.using(using).all())
-                else:
-                    items_total = model._default_manager.using(using).count()
-                    chunks_total = (items_total / max_records_per_chunk) +1
+            for model in sort_dependencies(app_list.items()):
+                model_count += 1
+
+                if model in excluded_models:
+                    continue
+                if not model._meta.proxy and router.allow_syncdb(using, model):
+                    if use_base_manager:
+                        objects = model._base_manager
+                    else:
+                        objects = model._default_manager
+
+                    queryset = objects.using(using).order_by(model._meta.pk.name)
+                    if primary_keys:
+                        queryset = queryset.filter(pk__in=primary_keys)
+
+                    items_total = queryset.count()
+                    chunk_count = 0
+                    chunks_total = (items_total / max_records_per_chunk) + (1 if (items_total % max_records_per_chunk) > 0 else 0)
+
                     for chunk_num in range(0, chunks_total):
-                        output_objects = model._default_manager.using(using).all().order_by('pk')[chunk_num*max_records_per_chunk:(chunk_num+1)*max_records_per_chunk]
-                        if output_objects:
-                            chunk_count += 1 
-                            dump_file_name = output_folder + "/%d_%d.json" % (model_count, chunk_count)
-                            print "Dumping file: %s [%d]" % (dump_file_name, chunks_total)
-                            output = serializers.serialize(format, output_objects, indent=indent,
-                                        use_natural_keys=use_natural_keys)
+                        output_objects = queryset[chunk_num * max_records_per_chunk:(chunk_num + 1) * max_records_per_chunk]
+
+                        chunk_count += 1
+                        dump_file_name = output_folder + "/%04d_%04d.json" % (model_count, chunk_count)
+                        print "Dumping file: %s [%d/%d] for %s" % (dump_file_name, chunk_count, chunks_total, model.__name__)
+                        output = serializers.serialize(format, output_objects, indent=indent,
+                                    use_natural_keys=use_natural_keys)
+                        try:
                             with open(dump_file_name, "w") as dumpfile:
                                 dumpfile.write(output)
-        return ''
+                        except Exception as e:
+                            if show_traceback:
+                                raise
+                            raise CommandError("Unable to write file: %s" % e)
+
+        try:
+            self.stdout.ending = None
+            get_objects_into_chunks(max_records_per_chunk)
+        except Exception as e:
+            if show_traceback:
+                raise
+            raise CommandError("Unable to serialize database: %s" % e)
 
 def sort_dependencies(app_list):
     """Sort a list of app,modellist pairs into a single list of models.
@@ -161,11 +197,11 @@ def sort_dependencies(app_list):
             for field in model._meta.fields:
                 if hasattr(field.rel, 'to'):
                     rel_model = field.rel.to
-                    if hasattr(rel_model, 'natural_key'):
+                    if hasattr(rel_model, 'natural_key') and rel_model != model:
                         deps.append(rel_model)
             for field in model._meta.many_to_many:
                 rel_model = field.rel.to
-                if hasattr(rel_model, 'natural_key'):
+                if hasattr(rel_model, 'natural_key') and rel_model != model:
                     deps.append(rel_model)
             model_dependencies.append((model, deps))
 
