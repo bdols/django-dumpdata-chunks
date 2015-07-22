@@ -28,6 +28,9 @@ class Command(BaseCommand):
         make_option('--pks', dest='primary_keys', help="Only dump objects with "
             "given primary keys. Accepts a comma seperated list of keys. "
             "This option will only work when you specify one model."),
+        make_option('--pkstart', dest='primary_key_start', type='int', help="Only dump objects with "
+            "a primary key greater than and equal to specified value. "
+            "This option will only work when you specify one model."),
     )
     help = ("Output the contents of the database as a fixture of the given "
             "format (using each model's default manager unless --all is "
@@ -49,11 +52,16 @@ class Command(BaseCommand):
         use_natural_keys = options.get('use_natural_keys')
         use_base_manager = options.get('use_base_manager')
         pks = options.get('primary_keys')
+        pkstart = options.get('primary_key_start')
 
         if pks:
             primary_keys = pks.split(',')
         else:
             primary_keys = []
+        if pkstart:
+            primary_key_start = int(pkstart)
+        else:
+            primary_key_start = 0
 
         excluded_apps = set()
         excluded_models = set()
@@ -72,12 +80,12 @@ class Command(BaseCommand):
                     raise CommandError('Unknown app in excludes: %s' % exclude)
 
         if len(app_labels) == 0:
-            if primary_keys:
-                raise CommandError("You can only use --pks option with one model")
+            if primary_keys or primary_key_start:
+                raise CommandError("You can only use --pks or --pkstart option with one model")
             app_list = SortedDict((app, None) for app in get_apps() if app not in excluded_apps)
         else:
-            if len(app_labels) > 1 and primary_keys:
-                raise CommandError("You can only use --pks option with one model")
+            if len(app_labels) > 1 and (primary_keys or primary_key_start):
+                raise CommandError("You can only use --pks or --pkstart option with one model")
             app_list = SortedDict()
             for label in app_labels:
                 try:
@@ -98,8 +106,8 @@ class Command(BaseCommand):
                     else:
                         app_list[app] = [model]
                 except ValueError:
-                    if primary_keys:
-                        raise CommandError("You can only use --pks option with one model")
+                    if primary_keys or primary_key_start:
+                        raise CommandError("You can only use --pks or --pkstart option with one model")
                     # This is just an app - no model qualifier
                     app_label = label
                     try:
@@ -129,7 +137,7 @@ class Command(BaseCommand):
 
                 if model in excluded_models:
                     continue
-                if not model._meta.proxy and router.allow_syncdb(using, model):
+                if not model._meta.proxy and router.allow_migrate(using, model):
                     if use_base_manager:
                         objects = model._base_manager
                     else:
@@ -138,6 +146,8 @@ class Command(BaseCommand):
                     queryset = objects.using(using).order_by(model._meta.pk.name)
                     if primary_keys:
                         queryset = queryset.filter(pk__in=primary_keys)
+                    if primary_key_start:
+                        queryset = queryset.filter(pk__gte=primary_key_start)
 
                     items_total = queryset.count()
                     chunk_count = 0
